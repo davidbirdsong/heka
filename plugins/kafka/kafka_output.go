@@ -49,12 +49,11 @@ type KafkaOutputConfig struct {
 	TopicVariable string `toml:"topic_variable"` // Topic extracted from a message variable
 	Topic         string // Static topic
 
-	RequiredAcks               string `toml:"required_acks"` // NoResponse, WaitForLocal, WaitForAll
-	Timeout                    uint32
-	CompressionCodec           string `toml:"compression_codec"` // None, GZIP, Snappy
-	MaxBufferTime              uint32 `toml:"max_buffer_time"`
-	MaxBufferedBytes           uint32 `toml:"max_buffered_bytes"`
-	BackPressureThresholdBytes uint32 `toml:"back_pressure_threshold_bytes"`
+	RequiredAcks     string `toml:"required_acks"` // NoResponse, WaitForLocal, WaitForAll
+	Timeout          uint32
+	CompressionCodec string `toml:"compression_codec"` // None, GZIP, Snappy
+	FlushByteCount   int    `toml:"max_buffered_bytes"`
+	FlushFrequency   uint32 `toml:"max_buffer_time"`
 }
 
 var Shutdown = errors.New("Shutdown Kafka error processing")
@@ -86,6 +85,8 @@ type KafkaOutput struct {
 
 func (k *KafkaOutput) ConfigStruct() interface{} {
 	hn := k.pipelineConfig.Hostname()
+
+	dconfig := sarama.NewProducerConfig()
 	return &KafkaOutputConfig{
 		Id:                         hn,
 		MetadataRetries:            3,
@@ -98,9 +99,7 @@ func (k *KafkaOutput) ConfigStruct() interface{} {
 		Partitioner:                "Random",
 		RequiredAcks:               "WaitForLocal",
 		CompressionCodec:           "None",
-		MaxBufferTime:              1,
-		MaxBufferedBytes:           1,
-		BackPressureThresholdBytes: 50 * 1024 * 1024,
+		FlushByteCount:             dconfig.FlushByteCount,
 	}
 }
 
@@ -219,17 +218,17 @@ func (k *KafkaOutput) Init(config interface{}) (err error) {
 
 	switch k.config.Partitioner {
 	case "Random":
-		k.pconfig.Partitioner = sarama.NewRandomPartitioner()
+		k.pconfig.Partitioner = sarama.NewRandomPartitioner
 		if len(k.config.HashVariable) > 0 {
 			return fmt.Errorf("hash_variable should not be set for the %s partitioner", k.config.Partitioner)
 		}
 	case "RoundRobin":
-		k.pconfig.Partitioner = new(sarama.RoundRobinPartitioner)
+		k.pconfig.Partitioner = sarama.NewRoundRobinPartitioner
 		if len(k.config.HashVariable) > 0 {
 			return fmt.Errorf("hash_variable should not be set for the %s partitioner", k.config.Partitioner)
 		}
 	case "Hash":
-		k.pconfig.Partitioner = sarama.NewHashPartitioner()
+		k.pconfig.Partitioner = sarama.NewHashPartitioner
 		if k.hashVariable = verifyMessageVariable(k.config.HashVariable); k.hashVariable == nil {
 			return fmt.Errorf("invalid hash_variable: %s", k.config.HashVariable)
 		}
@@ -269,9 +268,9 @@ func (k *KafkaOutput) Init(config interface{}) (err error) {
 		return fmt.Errorf("invalid compression_codec: %s", k.config.CompressionCodec)
 	}
 
-	k.pconfig.MaxBufferedBytes = k.config.MaxBufferedBytes
-	k.pconfig.MaxBufferTime = time.Duration(k.config.MaxBufferTime) * time.Millisecond
-	k.pconfig.BackPressureThresholdBytes = k.config.BackPressureThresholdBytes
+	k.pconfig.FlushByteCount = k.config.FlushByteCount
+	k.pconfig.FlushFrequency = time.Duration(k.config.FlushFrequency) * time.Millisecond
+	k.pconfig.AckSuccesses = true
 
 	k.client, err = sarama.NewClient(k.config.Id, k.config.Addrs, k.cconfig)
 	if err != nil {
@@ -314,13 +313,15 @@ func (k *KafkaOutput) Run(or pipeline.OutputRunner, h pipeline.PluginHelper) (er
 	errChan := k.producer.Errors()
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go k.processKafkaErrors(or, errChan, &wg)
+	//go k.processKafkaErrors(or, errChan, &wg)
 
 	var (
 		pack  *pipeline.PipelinePack
 		topic = k.config.Topic
 		key   sarama.Encoder
 	)
+	msg := &sarama.MessageToSend{}
+	ack_msg := &sarama.MessageToSend{}
 
 	for pack = range inChan {
 		atomic.AddInt64(&k.processMessageCount, 1)
